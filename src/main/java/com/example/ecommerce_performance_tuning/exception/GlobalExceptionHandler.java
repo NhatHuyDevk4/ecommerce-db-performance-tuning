@@ -237,8 +237,8 @@ public class GlobalExceptionHandler {
                 .path(req.getRequestURI())
                 .error(ApiResponse.ErrorDetail.builder()
                     .code("INTERNAL_ERROR")
-                    .message("Internal server error")
-                    .detail("Please contact support if the problem persists")
+                    .message(ex.getClass().getSimpleName())
+                    .detail(ex.getMessage())
                     .build())
                 .build()
         );

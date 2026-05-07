@@ -1,0 +1,24 @@
+{
+  "properties": [
+    {
+      "name": "app.datasource.optimized.url",
+      "type": "java.lang.String",
+      "description": "JDBC URL for the optimized (PerformanceTest) datasource."
+    },
+    {
+      "name": "app.datasource.optimized.username",
+      "type": "java.lang.String",
+      "description": "Username for the optimized datasource."
+    },
+    {
+      "name": "app.datasource.optimized.password",
+      "type": "java.lang.String",
+      "description": "Password for the optimized datasource."
+    },
+    {
+      "name": "app.datasource.optimized.driver-class-name",
+      "type": "java.lang.String",
+      "description": "JDBC driver class for the optimized datasource."
+    }
+  ]
+}

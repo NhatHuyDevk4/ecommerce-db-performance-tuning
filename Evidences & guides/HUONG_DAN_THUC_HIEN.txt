@@ -1,0 +1,809 @@
+================================================================
+   HƯỚNG DẪN THỰC HIỆN & CHỤP EVIDENCE
+   PROJECT: TỐI ƯU CƠ SỞ DỮ LIỆU QUY MÔ LỚN (ECOMMERCE)
+================================================================
+   CÔNG NGHỆ: PostgreSQL 18  |  Spring Boot 3.5 (Java 21)  |  JDBC
+   TOOLS    : pgAdmin 4,  Swagger UI (localhost:8081)
+
+   TỔNG QUAN – 5 BƯỚC THỰC HIỆN
+   ─────────────────────────────────────────────────────────────
+   Bước 1 │ Chuẩn bị: Schema + Mock Data + Table Partitioned
+   Bước 2 │ JDBC Batch Processing vs Single Insert  (Java API)
+   Bước 3 │ Index: B-Tree / Composite / Covering  (pgAdmin SQL)
+   Bước 4 │ Pagination: Deep OFFSET vs Keyset  (pgAdmin SQL)
+   Bước 5 │ Table Partitioning + Aggregation  (pgAdmin SQL)
+   ─────────────────────────────────────────────────────────────
+
+   EVIDENCE CẦN CHỤP (13 ảnh)
+   1a  pgAdmin – 2 databases trong Object Explorer
+   1b  pgAdmin – 4 bảng bên trong mỗi database
+   2   SELECT COUNT(*) – 4 bảng đủ rows
+   3   Swagger UI tại localhost:8081
+   4   API /single-insert  – response JSON
+   5   API /batch-insert   – response JSON
+   6   EXPLAIN – NonePerformanceTest (Seq Scan, trước index)
+   7   pgAdmin tab "Indexes" – PerformanceTest (sau khi tạo index)
+   8   EXPLAIN – PerformanceTest (Index Scan / Index Only Scan)
+   9a  EXPLAIN – OFFSET offset nhỏ vs offset lớn (NonePerformanceTest)
+   9b  EXPLAIN – Keyset pagination (PerformanceTest)
+   10a EXPLAIN – Aggregation GROUP BY  (cả 2 DB)
+   10b EXPLAIN – orders thường vs orders_partitioned
+   10c COUNT(*) từng partition
+================================================================
+
+
+================================================================
+BƯỚC 1: CHUẨN BỊ SCHEMA & MOCK DATA
+================================================================
+[Thực hiện trong: pgAdmin Query Tool]
+
+────────────────────────────────────────────────────────────────
+1.1  Tạo 2 Databases
+────────────────────────────────────────────────────────────────
+pgAdmin → chuột phải "Databases" → Create → Database
+
+  Tên DB 1: NonePerformanceTest    (baseline – KHÔNG có index / partition)
+  Tên DB 2: PerformanceTest        (sẽ thêm index ở Bước 3 + partition ở Bước 5)
+
+────────────────────────────────────────────────────────────────
+1.2  Tạo Schema  ──  chạy trên CẢ 2 databases
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn đúng DB → paste toàn bộ SQL dưới → F5
+
+-- =====================================================
+-- BẢNG 1: users  (100,000 rows)
+-- =====================================================
+CREATE TABLE users (
+    id          BIGINT PRIMARY KEY,
+    full_name   VARCHAR(100),
+    email       VARCHAR(150),
+    phone       VARCHAR(20),
+    address     TEXT,
+    created_at  TIMESTAMP
+);
+
+-- =====================================================
+-- BẢNG 2: products  (50,000 rows)
+-- =====================================================
+CREATE TABLE products (
+    id              BIGINT PRIMARY KEY,
+    name            VARCHAR(150),
+    category        VARCHAR(50),
+    price           NUMERIC(12,2),
+    stock_quantity  INTEGER,
+    created_at      TIMESTAMP
+);
+
+-- =====================================================
+-- BẢNG 3: orders  (3,000,000 rows)
+-- FK → users: mỗi đơn hàng thuộc về 1 khách hàng
+-- =====================================================
+CREATE TABLE orders (
+    id              BIGINT PRIMARY KEY,
+    user_id         BIGINT REFERENCES users(id),
+    status          VARCHAR(30),
+    total_amount    NUMERIC(12,2),
+    created_at      TIMESTAMP,
+    updated_at      TIMESTAMP
+);
+
+-- =====================================================
+-- BẢNG 4: order_items  (10,000,000 rows)
+-- FK → orders  : mỗi item thuộc về 1 đơn hàng
+-- FK → products: mỗi item là 1 sản phẩm
+-- =====================================================
+CREATE TABLE order_items (
+    id          BIGINT PRIMARY KEY,
+    order_id    BIGINT REFERENCES orders(id),
+    product_id  BIGINT REFERENCES products(id),
+    quantity    INTEGER,
+    price       NUMERIC(12,2),
+    total_price NUMERIC(12,2)
+);
+
+► Lặp lại ĐÚNG CÂU SQL TRÊN cho database còn lại.
+
+[EVIDENCE 1a] 1 ảnh – Chụp toàn bộ cửa sổ pgAdmin, phần Object Explorer bên trái thấy 2 tên: NonePerformanceTest, PerformanceTest.
+[EVIDENCE 1b] 1 ảnh – Mở rộng từng database, thấy Schemas → Tables → 4 bảng (users, products, orders, order_items). Có thể chụp chung 2 DB nếu vừa màn hình, hoặc chụp riêng 2 ảnh.
+
+────────────────────────────────────────────────────────────────
+1.3  Sinh Mock Data  ──  chạy trên CẢ 2 databases
+────────────────────────────────────────────────────────────────
+!!! QUAN TRỌNG: chạy ĐÚNG THỨ TỰ 4 câu lệnh INSERT vì có FOREIGN KEY.
+    users + products trước → orders sau → order_items cuối cùng.
+
+-- =========================
+-- [1/4] 100,000 users
+-- =========================
+INSERT INTO users (id, full_name, email, phone, address, created_at)
+SELECT
+    gs,
+    'User_' || gs,
+    'user' || gs || '@test.com',
+    '09' || LPAD(gs::TEXT, 8, '0'),
+    'Address ' || gs,
+    NOW() - (random() * INTERVAL '365 days')
+FROM generate_series(1, 100000) AS gs;
+
+-- =========================
+-- [2/4] 50,000 products
+-- =========================
+INSERT INTO products (id, name, category, price, stock_quantity, created_at)
+SELECT
+    gs,
+    'Product_' || gs,
+    (ARRAY['Electronics','Clothing','Books','Food','Sports'])[floor(random()*5+1)],
+    (random() * 1000000)::NUMERIC(12,2),
+    floor(random() * 1000)::INTEGER,
+    NOW() - (random() * INTERVAL '365 days')
+FROM generate_series(1, 50000) AS gs;
+
+-- =========================
+-- [3/4] 3,000,000 orders  (~30–60 giây)
+-- =========================
+INSERT INTO orders (id, user_id, status, total_amount, created_at, updated_at)
+SELECT
+    gs,
+    floor(random() * 100000 + 1)::BIGINT,
+    (ARRAY['PENDING','PROCESSING','COMPLETED','CANCELLED'])[floor(random()*4+1)],
+    (random() * 10000000)::NUMERIC(12,2),
+    NOW() - (random() * INTERVAL '730 days'),
+    NOW()
+FROM generate_series(1, 3000000) AS gs;
+
+-- =========================
+-- [4/4] 10,000,000 order_items  (~2–5 phút)
+-- =========================
+INSERT INTO order_items (id, order_id, product_id, quantity, price, total_price)
+SELECT
+    gs,
+    floor(random() * 3000000 + 1)::BIGINT,
+    floor(random() * 50000  + 1)::BIGINT,
+    floor(random() * 10 + 1)::INTEGER,
+    (random() * 500000)::NUMERIC(12,2),
+    (random() * 500000)::NUMERIC(12,2)
+FROM generate_series(1, 10000000) AS gs;
+
+-- Kiểm tra sau khi insert xong (chạy trên từng DB):
+SELECT 'users'       AS bang, COUNT(*) AS so_rows FROM users
+UNION ALL
+SELECT 'products',             COUNT(*)           FROM products
+UNION ALL
+SELECT 'orders',               COUNT(*)           FROM orders
+UNION ALL
+SELECT 'order_items',          COUNT(*)           FROM order_items;
+
+► Lặp lại 4 INSERT + 1 SELECT COUNT trên database còn lại.
+
+[EVIDENCE 2] 1 ảnh – Chụp kết quả của câu SELECT COUNT(*) UNION ALL, thấy bảng kết quả 4 dòng:
+             users | 100000,  products | 50000,  orders | 3000000,  order_items | 10000000
+             (Chạy trên 1 DB là đủ, hoặc chụp cả 2 DB để so sánh)
+
+────────────────────────────────────────────────────────────────
+1.4  Tạo bảng Partitioned  ──  chỉ trên PerformanceTest
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn PerformanceTest → chạy toàn bộ SQL dưới:
+
+LƯU Ý: PostgreSQL KHÔNG cho phép ALTER một bảng thường thành bảng
+partitioned. Vì vậy phải tạo bảng mới (orders_partitioned) rồi
+copy dữ liệu sang. Mục đích: so sánh cùng query tại Bước 5.
+
+-- Tạo bảng partitioned chia theo cột created_at (Range)
+CREATE TABLE orders_partitioned (
+    id              BIGINT NOT NULL,
+    user_id         BIGINT,
+    status          VARCHAR(30),
+    total_amount    NUMERIC(12,2),
+    created_at      TIMESTAMP NOT NULL,
+    updated_at      TIMESTAMP,
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+-- Tạo 4 partition con theo từng năm
+CREATE TABLE orders_part_2023 PARTITION OF orders_partitioned
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+
+CREATE TABLE orders_part_2024 PARTITION OF orders_partitioned
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE TABLE orders_part_2025 PARTITION OF orders_partitioned
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE TABLE orders_part_default PARTITION OF orders_partitioned DEFAULT;
+
+-- Copy 3 triệu rows từ orders thường sang (~3–10 phút)
+INSERT INTO orders_partitioned (id, user_id, status, total_amount, created_at, updated_at)
+SELECT id, user_id, status, total_amount, created_at, updated_at
+FROM orders;
+
+-- Kiểm tra phân phối rows trong từng partition:
+SELECT
+    tableoid::regclass AS partition_name,
+    COUNT(*)           AS row_count
+FROM orders_partitioned
+GROUP BY tableoid
+ORDER BY partition_name;
+
+
+================================================================
+BƯỚC 2: JDBC BATCH PROCESSING vs SINGLE INSERT  (Java API) (Thực hiện sau cùng)
+================================================================
+[Thực hiện trong: VS Code Terminal + Swagger UI]
+
+────────────────────────────────────────────────────────────────
+2.1  Khởi động Spring Boot
+────────────────────────────────────────────────────────────────
+Mở Terminal trong VS Code và chạy:
+
+  cd d:\QN26_FR_JAVA_01\Projects\Java\ecommerce-db-performance-tuning
+  ./mvnw spring-boot:run
+
+Đợi thấy dòng: "Started EcommercePerformanceTuningApplication on port 8081"
+Mở trình duyệt: http://localhost:8081/swagger-ui.html
+
+[EVIDENCE 3] 1 ảnh – Chụp trình duyệt đang mở http://localhost:8081/swagger-ui.html
+             Thấy 3 API trong nhóm "Benchmark": POST /single-insert, POST /batch-insert, DELETE /clear
+
+────────────────────────────────────────────────────────────────
+2.2  Single Insert  (chậm – mỗi row = 1 roundtrip tới DB)
+────────────────────────────────────────────────────────────────
+Swagger UI → POST /api/benchmark/single-insert → Try it out:
+  useOptimized = false      ← chạy trên NonePerformanceTest
+  rowCount     = 1000
+
+Hoặc dùng curl:
+  curl -X POST "http://localhost:8081/api/benchmark/single-insert?useOptimized=false&rowCount=1000"
+
+Kết quả JSON mẫu:
+  {
+    "database":       "NonePerformanceTest",
+    "rowCount":       1000,
+    "singleInsertMs": 55000,
+    "note":           "Each row = 1 separate JDBC roundtrip. Total: 1000 transactions."
+  }
+
+[EVIDENCE 4] 1 ảnh – Sau khi Swagger trả kết quả, chụp phần "Response body" thấy JSON có singleInsertMs.
+             Gợi ý: kéo rộng phần Response để thấy toàn bộ JSON trước khi chụp.
+[Kết quả dạng text]:
+Network-time: 56.33s (bật inspect)
+{
+  "status": 200,
+  "message": "Single insert completed",
+  "data": {
+    "singleInsertMs": 55869,
+    "note": "Each row = 1 separate JDBC roundtrip. Total: 1000 transactions.",
+    "database": "NonePerformanceTest",
+    "rowCount": 1000
+  },
+  "timestamp": "2026-04-28T08:33:11.428966300Z"
+}
+[Kết quả tổng hợp]:
+Network time:   56,330 ms  (toàn bộ từ click đến nhận response)
+singleInsertMs: 55,869 ms  (chỉ phần vòng lặp INSERT)
+─────────────────────────
+Phần không đo:    461 ms   ← cleanAll() TRUNCATE 3 bảng + HTTP overhead
+
+────────────────────────────────────────────────────────────────
+2.3  Batch Insert  (nhanh – toàn bộ rows gửi trong 1 batch)
+────────────────────────────────────────────────────────────────
+Swagger UI → POST /api/benchmark/batch-insert → Try it out:
+  useOptimized = false      ← cùng database NonePerformanceTest
+  rowCount     = 1000
+
+Hoặc dùng curl:
+  curl -X POST "http://localhost:8081/api/benchmark/batch-insert?useOptimized=false&rowCount=1000"
+
+Kết quả JSON mẫu:
+  {
+    "database":     "NonePerformanceTest",
+    "rowCount":     1000,
+    "batchInsertMs": 85,
+    "note":         "All 1000 rows sent in 1 PreparedStatement.executeBatch() call."
+  }
+
+[EVIDENCE 5] 1 ảnh – Tương tự Evidence 4, chụp Response body của /batch-insert thấy batchInsertMs.
+[Kết quả bằng text]:
+Network-time: 291ms (bật inspect)
+{
+  "status": 200,
+  "message": "Batch insert completed",
+  "data": {
+    "batchInsertMs": 77,
+    "note": "All 1000 rows sent in 1 PreparedStatement.executeBatch() call.",
+    "database": "NonePerformanceTest",
+    "rowCount": 1000
+  },
+  "timestamp": "2026-04-28T08:43:38.939119100Z"
+}
+[Kết quả tổng hợp]:
+Network time:     291 ms  (toàn bộ)
+batchInsertMs:     77 ms  (chỉ phần executeBatch())
+──────────────────────────
+Phần không đo:    214 ms  ← cleanAll() TRUNCATE 3 bảng + HTTP overhead
+
+
+────────────────────────────────────────────────────────────────
+2.4  Xóa dữ liệu test sau khi chụp hình (OPTIONAL) (KHÔNG LÀM)
+────────────────────────────────────────────────────────────────
+Swagger UI → DELETE /api/benchmark/clear → Try it out:
+  useOptimized = false
+
+Hoặc dùng curl:
+  curl -X DELETE "http://localhost:8081/api/benchmark/clear?useOptimized=false"
+
+API sẽ TRUNCATE toàn bộ dữ liệu test (order_items → orders → users CASCADE).
+
+────────────────────────────────────────────────────────────────
+BẢNG SO SÁNH  (điền kết quả thực tế vào):
+────────────────────────────────────────────────────────────────
+  rowCount = 1000 │ DB = NonePerformanceTest
+  ┌──────────────────────┬───────────────────┬──────────────────────────────────┐
+  │ Phương pháp          │ Thời gian (ms)    │ Ghi chú                          │
+  ├──────────────────────┼───────────────────┼──────────────────────────────────┤
+  │ Single Insert        │ 55,869 ms         │ 1000 transactions riêng biệt     │
+  │ Batch Insert         │ 77 ms             │ 1 executeBatch() duy nhất        │
+  │ Cải thiện (lần)      │ single / batch =  │ 55869 / 77 ≈ 725 lần             │
+  └──────────────────────┴───────────────────┴──────────────────────────────────┘
+
+
+================================================================
+BƯỚC 3: INDEX PERFORMANCE  –  B-Tree / Composite / Covering
+================================================================
+[Thực hiện trong: pgAdmin Query Tool]
+
+LÝ THUYẾT NHANH:
+  B-Tree Index    – tìm kiếm theo 1 cột đơn, O(log n)
+  Composite Index – tìm kiếm theo nhiều cột (thứ tự cột quan trọng)
+  Covering Index  – lưu thêm cột SELECT vào index → không cần đọc heap (Index Only Scan)
+
+────────────────────────────────────────────────────────────────
+3.1  EXPLAIN ANALYZE  ──  NonePerformanceTest  (không có index)
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn NonePerformanceTest → chạy từng câu:
+
+-- [3.1a] B-Tree: lọc theo 1 cột đơn → Seq Scan expected
+EXPLAIN ANALYZE
+SELECT * FROM products WHERE category = 'Electronics';
+[Kết quả dạng text]: 95ms
+"Seq Scan on products  (cost=0.00..1153.00 rows=8445 width=48) (actual time=0.018..4.287 rows=8402.00 loops=1)"
+"  Filter: ((category)::text = 'Electronics'::text)"
+"  Rows Removed by Filter: 41598"
+"  Buffers: shared hit=528"
+"Planning Time: 0.091 ms"
+"Execution Time: 4.540 ms"
+
+-- [3.1b] Composite: lọc đồng thời 2 cột → Seq Scan expected
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE user_id = 12345 AND status = 'PENDING';
+[Kết quả dạng text]: 291ms
+"Gather  (cost=1000.00..50736.19 rows=8 width=48) (actual time=0.822..159.397 rows=14.00 loops=1)"
+"  Workers Planned: 2"
+"  Workers Launched: 2"
+"  Buffers: shared hit=13410 read=17574"
+"  ->  Parallel Seq Scan on orders  (cost=0.00..49735.39 rows=3 width=48) (actual time=1.774..84.441 rows=4.67 loops=3)"
+"        Filter: ((user_id = 12345) AND ((status)::text = 'PENDING'::text))"
+"        Rows Removed by Filter: 999995"
+"        Buffers: shared hit=13410 read=17574"
+"Planning Time: 0.086 ms"
+"Execution Time: 159.438 ms"
+
+-- [3.1c] Covering: chỉ lấy name, price theo category → Seq Scan expected
+EXPLAIN ANALYZE
+SELECT name, price FROM products WHERE category = 'Electronics';
+[Kết quả dạng text]: 99ms
+"Seq Scan on products  (cost=0.00..1153.00 rows=8445 width=21) (actual time=0.019..4.175 rows=8402.00 loops=1)"
+"  Filter: ((category)::text = 'Electronics'::text)"
+"  Rows Removed by Filter: 41598"
+"  Buffers: shared hit=528"
+"Planning Time: 0.082 ms"
+"Execution Time: 4.409 ms"
+
+=> Quan sát: dòng "Seq Scan on ...", "Rows Removed by Filter: ...", "Execution Time: ... ms"
+
+[EVIDENCE 6] 3 ảnh riêng biệt – Mỗi query chụp 1 ảnh sau khi chạy xong:
+  Ảnh 6a: Kết quả câu 3.1a (products WHERE category)   → thấy "Seq Scan on products"
+  Ảnh 6b: Kết quả câu 3.1b (orders WHERE user_id+status) → thấy "Seq Scan on orders"
+  Ảnh 6c: Kết quả câu 3.1c (SELECT name,price WHERE cat) → thấy "Seq Scan on products"
+
+  Cách chụp trong pgAdmin:
+  1. Chạy 1 câu EXPLAIN ANALYZE (bôi đen đúng câu đó → F5)
+  2. Kết quả hiện ở panel "Data Output" phía dưới
+  3. Chụp màn hình toàn bộ pgAdmin, thấy câu SQL trên + kết quả dưới
+  4. Làm tương tự cho 2 câu còn lại 
+
+────────────────────────────────────────────────────────────────
+3.2  Tạo Index  ──  trên PerformanceTest
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn PerformanceTest → chạy:
+
+-- B-Tree Index đơn (single column)
+CREATE INDEX idx_products_category    ON products(category);
+CREATE INDEX idx_orders_user_id       ON orders(user_id);
+CREATE INDEX idx_orders_status        ON orders(status);
+CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+
+-- Composite Index (user_id ở đầu → phục vụ cả query chỉ có user_id)
+CREATE INDEX idx_orders_user_status ON orders(user_id, status);
+
+-- Covering Index (INCLUDE: cột thêm để tránh đọc heap)
+CREATE INDEX idx_products_category_cover ON products(category) INCLUDE (name, price);
+
+14s155ms
+
+[EVIDENCE 7] 2–4 ảnh – Trong pgAdmin, chọn database PerformanceTest:
+  Cách xem: Object Explorer → PerformanceTest → Schemas → public → Tables → [tên bảng] → Indexes
+  Ảnh 7a: Indexes của bảng products  (thấy idx_products_category, idx_products_category_cover)
+  Ảnh 7b: Indexes của bảng orders    (thấy idx_orders_user_id, idx_orders_status, idx_orders_user_status)
+  (Tùy chọn) Ảnh 7c: Indexes của bảng order_items (thấy idx_order_items_order_id)
+
+  Cách chụp: chuột phải vào bảng → Properties → tab Indexes, HOẶC
+             mở rộng cây Indexes trong Object Explorer rồi chụp
+
+────────────────────────────────────────────────────────────────
+3.3  EXPLAIN ANALYZE  ──  PerformanceTest  (có index)
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn PerformanceTest → chạy ĐÚNG CÁC CÂU của mục 3.1:
+
+-- [3.3a] B-Tree: cùng câu → Bitmap Index Scan / Index Scan expected
+EXPLAIN ANALYZE
+SELECT * FROM products WHERE category = 'Electronics';
+[Kết quả dạng text]: 75ms
+"Bitmap Heap Scan on products  (cost=96.59..728.30 rows=8297 width=48) (actual time=0.984..2.533 rows=8402.00 loops=1)"
+"  Recheck Cond: ((category)::text = 'Electronics'::text)"
+"  Heap Blocks: exact=507"
+"  Buffers: shared hit=507 read=9"
+"  ->  Bitmap Index Scan on idx_products_category  (cost=0.00..94.52 rows=8297 width=0) (actual time=0.876..0.876 rows=8402.00 loops=1)"
+"        Index Cond: ((category)::text = 'Electronics'::text)"
+"        Index Searches: 1"
+"        Buffers: shared read=9"
+"Planning:"
+"  Buffers: shared hit=62 read=6 dirtied=4"
+"Planning Time: 2.859 ms"
+"Execution Time: 2.778 ms"
+
+-- [3.3b] Composite: cùng câu → Bitmap Index Scan on idx_orders_user_status
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE user_id = 12345 AND status = 'PENDING';
+[Kết quả dạng text]: 116ms
+"Index Scan using idx_orders_user_status on orders  (cost=0.43..36.59 rows=8 width=48) (actual time=0.174..0.433 rows=14.00 loops=1)"
+"  Index Cond: ((user_id = 12345) AND ((status)::text = 'PENDING'::text))"
+"  Index Searches: 1"
+"  Buffers: shared hit=4 read=16"
+"Planning:"
+"  Buffers: shared hit=78 read=4"
+"Planning Time: 11.227 ms"
+"Execution Time: 0.454 ms"
+
+-- [3.3c] Covering: cùng câu → Index Only Scan (không đọc heap)
+EXPLAIN ANALYZE
+SELECT name, price FROM products WHERE category = 'Electronics';
+[Kết quả dạng text]: 91ms
+"Index Only Scan using idx_products_category_cover on products  (cost=0.41..443.14 rows=8297 width=21) (actual time=0.372..2.041 rows=8402.00 loops=1)"
+"  Index Cond: (category = 'Electronics'::text)"
+"  Heap Fetches: 0"
+"  Index Searches: 1"
+"  Buffers: shared hit=1 read=63"
+"Planning Time: 0.158 ms"
+"Execution Time: 2.319 ms"
+
+=> Quan sát: "Bitmap Index Scan" / "Index Scan" / "Index Only Scan"
+   So sánh Execution Time với kết quả mục 3.1
+
+[EVIDENCE 8] 3 ảnh riêng biệt – Chụp y hệt như Evidence 6 nhưng trên PerformanceTest:
+  Ảnh 8a: Kết quả câu 3.3a → thấy "Bitmap Index Scan on idx_products_category"
+  Ảnh 8b: Kết quả câu 3.3b → thấy "Bitmap Index Scan on idx_orders_user_status"
+  Ảnh 8c: Kết quả câu 3.3c → thấy "Index Only Scan on idx_products_category_cover"
+
+────────────────────────────────────────────────────────────────
+BẢNG SO SÁNH  (điền kết quả thực tế vào):
+────────────────────────────────────────────────────────────────
+  ┌──────────────────────────────────────┬──────────────┬──────────────┬──────────────────────┐
+  │ Query                                │ NonePerf(ms) │ PerformT(ms) │ Loại scan (PerformT) │
+  ├──────────────────────────────────────┼──────────────┼──────────────┼──────────────────────┤
+  │ products WHERE category='Elec...'    │ 4.540 ms     │ 2.778 ms     │ Bitmap Index Scan    │
+  │ orders WHERE user_id+status          │ 159.438 ms   │ 0.454 ms     │ Index Scan (Composite│
+  │ SELECT name,price WHERE category=... │ 4.409 ms     │ 2.319 ms     │ Index Only Scan      │
+  └──────────────────────────────────────┴──────────────┴──────────────┴──────────────────────┘
+
+
+================================================================
+BƯỚC 4: PAGINATION  –  Deep OFFSET vs Keyset (Seek Method)
+================================================================
+[Thực hiện trong: pgAdmin Query Tool]
+
+LÝ THUYẾT NHANH:
+  OFFSET Pagination : SELECT ... LIMIT 20 OFFSET n
+    → PostgreSQL phải ĐỌC QUA n rows rồi bỏ, chi phí O(n), chậm khi n lớn.
+  Keyset Pagination : SELECT ... WHERE id > lastId LIMIT 20
+    → PostgreSQL nhảy thẳng qua index, chi phí O(log n), luôn nhanh.
+
+────────────────────────────────────────────────────────────────
+4.1  OFFSET Pagination  ──  NonePerformanceTest
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn NonePerformanceTest
+
+-- Offset nhỏ (tham chiếu – thấy ít chênh lệch)
+EXPLAIN ANALYZE
+SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 100;
+[Kết quả dạng text]: 104ms
+"Limit  (cost=4.06..4.79 rows=20 width=48) (actual time=3.346..3.352 rows=20.00 loops=1)"
+"  Buffers: shared read=5"
+"  ->  Index Scan using orders_pkey on orders  (cost=0.43..108902.76 rows=3000222 width=48) (actual time=2.456..3.341 rows=120.00 loops=1)"
+"        Index Searches: 1"
+"        Buffers: shared read=5"
+"Planning:"
+"  Buffers: shared hit=13"
+"Planning Time: 0.128 ms"
+"Execution Time: 3.370 ms"
+
+-- Offset lớn (deep pagination – chậm đáng kể)
+EXPLAIN ANALYZE
+SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 1000000;
+[Kết quả dạng text]: 482ms 
+"Limit  (cost=36298.52..36299.25 rows=20 width=48) (actual time=378.414..378.417 rows=20.00 loops=1)"
+"  Buffers: shared hit=5 read=13040"
+"  ->  Index Scan using orders_pkey on orders  (cost=0.43..108902.76 rows=3000222 width=48) (actual time=0.021..345.291 rows=1000020.00 loops=1)"
+"        Index Searches: 1"
+"        Buffers: shared hit=5 read=13040"
+"Planning Time: 0.094 ms"
+"Execution Time: 378.444 ms"
+
+=> Quan sát: thời gian tăng mạnh khi offset lớn dù dùng Index Scan trên pkey.
+   Dòng "Rows Removed by Filter" hoặc "Index Scan: rows=1000020"
+
+[EVIDENCE 9a] 2 ảnh riêng biệt:
+  Ảnh 9a-1: Kết quả OFFSET 100      → thời gian rất nhỏ (vài ms)
+  Ảnh 9a-2: Kết quả OFFSET 1000000  → thời gian lớn hơn nhiều (hàng trăm ms)
+  Chạy từng câu riêng (bôi đen đúng 2 dòng EXPLAIN ANALYZE + SELECT → F5)
+
+────────────────────────────────────────────────────────────────
+4.2  Keyset Pagination  ──  PerformanceTest
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn PerformanceTest
+(lastId = id của record cuối cùng trang trước, ví dụ 1000000)
+
+-- Keyset: WHERE id > lastId → không cần scan 1M rows phía trước
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE id > 1000000 ORDER BY id LIMIT 20;
+[Kết quả dạng text]:  91ms
+"Limit  (cost=0.43..1.21 rows=20 width=48) (actual time=12.510..12.518 rows=20.00 loops=1)"
+"  Buffers: shared read=4"
+"  ->  Index Scan using orders_pkey on orders  (cost=0.43..77251.72 rows=1990931 width=48) (actual time=12.508..12.514 rows=20.00 loops=1)"
+"        Index Cond: (id > 1000000)"
+"        Index Searches: 1"
+"        Buffers: shared read=4"
+"Planning:"
+"  Buffers: shared hit=19"
+"Planning Time: 0.203 ms"
+"Execution Time: 12.536 ms"
+
+=> Quan sát: "Index Scan using orders_pkey", chỉ đọc đúng 20 rows cần thiết.
+   Thời gian rất nhỏ dù "trang" nằm ở vị trí 1 triệu.
+
+[EVIDENCE 9b] 1 ảnh – Kết quả Keyset trên PerformanceTest → thấy "Index Scan using orders_pkey"
+              và thời gian rất nhỏ dù id > 1000000
+
+────────────────────────────────────────────────────────────────
+BẢNG SO SÁNH  (điền kết quả thực tế vào):
+────────────────────────────────────────────────────────────────
+  ┌───────────────────────────────────────┬─────────────────┬────────────────────────┐
+  │ Phương pháp                           │ Thời gian (ms)  │ Loại scan              │
+  ├───────────────────────────────────────┼─────────────────┼────────────────────────┤
+  │ OFFSET 100       (NonePerformanceTest)│ 3.370 ms        │ Index Scan (đọc 120)   │
+  │ OFFSET 1,000,000 (NonePerformanceTest)│ 378.444 ms      │ Index Scan (đọc 1M)    │
+  │ Keyset id>1M     (PerformanceTest)    │ 12.536 ms       │ Index Scan (đọc 20)    │
+  └───────────────────────────────────────┴─────────────────┴────────────────────────┘
+
+Cả 2 đều dùng orders_pkey, nhưng OFFSET buộc PostgreSQL đọc qua 1 triệu rows mới tới được trang cần. Keyset thì PostgreSQL nhảy thẳng trong B-Tree tới node id = 1000001 rồi đọc 20 rows tiếp theo.
+================================================================
+BƯỚC 5: TABLE PARTITIONING  +  AGGREGATION PERFORMANCE
+================================================================
+[Thực hiện trong: pgAdmin Query Tool]
+
+LÝ THUYẾT NHANH:
+  Table Partitioning  – chia 1 bảng lớn thành nhiều partition vật lý nhỏ hơn
+    theo một tiêu chí (Range theo ngày, List theo giá trị, Hash).
+    → Khi query có filter trên cột partition, PostgreSQL chỉ scan đúng partition
+      liên quan (Partition Pruning), bỏ qua hoàn toàn các partition còn lại.
+    → Ví dụ: bảng 3M rows chia 4 partition theo năm → filter năm 2024
+      chỉ cần đọc ~750K rows thay vì 3M rows.
+
+  Aggregation (GROUP BY)  – tính COUNT/SUM/AVG trên tập dữ liệu lớn.
+    → Không có index: Seq Scan toàn bộ bảng → HashAggregate → chậm.
+    → Có index trên cột GROUP BY: PostgreSQL có thể dùng Index Scan
+      thay vì Seq Scan trong một số trường hợp.
+    → Tuy nhiên: GROUP BY + SUM/COUNT toàn bảng thường vẫn Seq Scan
+      vì phải đọc tất cả rows để tính tổng hợp.
+
+────────────────────────────────────────────────────────────────
+5.1  Aggregation Performance  ──  so sánh 2 databases
+────────────────────────────────────────────────────────────────
+Câu lệnh GROUP BY tính tổng hợp trên toàn bảng orders:
+
+-- Chạy trên NonePerformanceTest (không có index trên status):
+-- Mở Query Tool → chọn NonePerformanceTest
+EXPLAIN ANALYZE
+SELECT status, COUNT(*), SUM(total_amount)
+FROM orders
+GROUP BY status;
+[Kết quả dạng text]: 437ms
+"Finalize GroupAggregate  (cost=53860.73..53862.04 rows=4 width=48) (actual time=380.944..389.543 rows=4.00 loops=1)"
+"  Group Key: status"
+"  Buffers: shared hit=10705 read=20295"
+"  ->  Gather Merge  (cost=53860.73..53861.89 rows=10 width=48) (actual time=380.935..389.529 rows=12.00 loops=1)"
+"        Workers Planned: 2"
+"        Workers Launched: 2"
+"        Buffers: shared hit=10705 read=20295"
+"        ->  Sort  (cost=52860.71..52860.72 rows=4 width=48) (actual time=353.588..353.589 rows=4.00 loops=3)"
+"              Sort Key: status"
+"              Sort Method: quicksort  Memory: 25kB"
+"              Buffers: shared hit=10705 read=20295"
+"              Worker 0:  Sort Method: quicksort  Memory: 25kB"
+"              Worker 1:  Sort Method: quicksort  Memory: 25kB"
+"              ->  Partial HashAggregate  (cost=52860.62..52860.67 rows=4 width=48) (actual time=353.553..353.554 rows=4.00 loops=3)"
+"                    Group Key: status"
+"                    Batches: 1  Memory Usage: 32kB"
+"                    Buffers: shared hit=10689 read=20295"
+"                    Worker 0:  Batches: 1  Memory Usage: 32kB"
+"                    Worker 1:  Batches: 1  Memory Usage: 32kB"
+"                    ->  Parallel Seq Scan on orders  (cost=0.00..43484.93 rows=1250092 width=16) (actual time=0.010..73.985 rows=1000000.00 loops=3)"
+"                          Buffers: shared hit=10689 read=20295"
+"Planning Time: 0.123 ms"
+"Execution Time: 389.605 ms"
+--------------------------------------------------------
+-- Chạy trên PerformanceTest (có idx_orders_status):
+-- Mở Query Tool → chọn PerformanceTest
+EXPLAIN ANALYZE
+SELECT status, COUNT(*), SUM(total_amount)
+FROM orders
+GROUP BY status;
+[Kết quả dạng text]:  489ms
+"Finalize GroupAggregate  (cost=53859.11..53860.43 rows=4 width=48) (actual time=376.849..383.272 rows=4.00 loops=1)"
+"  Group Key: status"
+"  Buffers: shared hit=1158 read=29842"
+"  ->  Gather Merge  (cost=53859.11..53860.28 rows=10 width=48) (actual time=376.840..383.259 rows=12.00 loops=1)"
+"        Workers Planned: 2"
+"        Workers Launched: 2"
+"        Buffers: shared hit=1158 read=29842"
+"        ->  Sort  (cost=52859.09..52859.10 rows=4 width=48) (actual time=348.768..348.768 rows=4.00 loops=3)"
+"              Sort Key: status"
+"              Sort Method: quicksort  Memory: 25kB"
+"              Buffers: shared hit=1158 read=29842"
+"              Worker 0:  Sort Method: quicksort  Memory: 25kB"
+"              Worker 1:  Sort Method: quicksort  Memory: 25kB"
+"              ->  Partial HashAggregate  (cost=52859.00..52859.05 rows=4 width=48) (actual time=348.734..348.735 rows=4.00 loops=3)"
+"                    Group Key: status"
+"                    Batches: 1  Memory Usage: 32kB"
+"                    Buffers: shared hit=1142 read=29842"
+"                    Worker 0:  Batches: 1  Memory Usage: 32kB"
+"                    Worker 1:  Batches: 1  Memory Usage: 32kB"
+"                    ->  Parallel Seq Scan on orders  (cost=0.00..43484.00 rows=1250000 width=16) (actual time=0.425..66.138 rows=1000000.00 loops=3)"
+"                          Buffers: shared hit=1142 read=29842"
+"Planning Time: 0.185 ms"
+"Execution Time: 383.340 ms"
+
+=> Quan sát: "HashAggregate", "Parallel Seq Scan", thời gian thực thi.
+
+[EVIDENCE 10a] 2 ảnh riêng biệt:
+  Ảnh 10a-1: Chạy trên NonePerformanceTest → chụp kết quả (Seq Scan, thời gian X ms)
+  Ảnh 10a-2: Chạy trên PerformanceTest    → chụp kết quả (Seq Scan vẫn nhưng thời gian Y ms)
+  Lưu ý: GROUP BY toàn bảng thường vẫn Seq Scan dù có index, vì phải đọc hết data để tính COUNT/SUM
+
+────────────────────────────────────────────────────────────────
+5.2  Table Partitioning  ──  so sánh trên PerformanceTest
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn PerformanceTest → chạy 2 câu sau:
+
+-- BASELINE: query trên bảng orders THƯỜNG (không partition)
+-- PostgreSQL PHẢI quét toàn bộ 3 triệu rows rồi lọc
+EXPLAIN ANALYZE
+SELECT * FROM orders
+WHERE created_at >= '2024-01-01' AND created_at < '2025-01-01';
+[Kết quả dạng text]: 980ms
+"Seq Scan on orders  (cost=0.00..75984.00 rows=293319 width=48) (actual time=1.127..873.832 rows=300123.00 loops=1)"
+"  Filter: ((created_at >= '2024-01-01 00:00:00'::timestamp without time zone) AND (created_at < '2025-01-01 00:00:00'::timestamp without time zone))"
+"  Rows Removed by Filter: 2699877"
+"  Buffers: shared hit=1424 read=29560"
+"Planning:"
+"  Buffers: shared hit=5 read=2"
+"Planning Time: 0.164 ms"
+"Execution Time: 886.472 ms"
+
+----------------------------------------------------
+-- OPTIMIZED: cùng câu query trên bảng orders_partitioned
+-- PostgreSQL CHỈ scan đúng partition orders_part_2024
+EXPLAIN ANALYZE
+SELECT * FROM orders_partitioned
+WHERE created_at >= '2024-01-01' AND created_at < '2025-01-01';
+[Kết quả dạng text]: 167ms 
+"Seq Scan on orders_part_2024 orders_partitioned  (cost=0.00..7596.85 rows=300063 width=48) (actual time=1.562..84.827 rows=300123.00 loops=1)"
+"  Filter: ((created_at >= '2024-01-01 00:00:00'::timestamp without time zone) AND (created_at < '2025-01-01 00:00:00'::timestamp without time zone))"
+"  Buffers: shared read=3095"
+"Planning:"
+"  Buffers: shared hit=129 read=8 dirtied=2"
+"Planning Time: 7.341 ms"
+"Execution Time: 95.126 ms"
+
+=> Quan sát baseline  : "Seq Scan on orders", Rows Removed rất lớn (~2.7M)
+   Quan sát optimized : "Seq Scan on orders_part_2024 orders_partitioned"
+                        Chỉ đọc ~300,000 rows, không scan partition khác
+
+[EVIDENCE 10b] 2 ảnh riêng biệt (chạy lần lượt 2 câu, chụp từng cái):
+  Ảnh 10b-1: Kết quả trên bảng orders thường     → thấy "Seq Scan on orders", Rows Removed ~2.7M
+  Ảnh 10b-2: Kết quả trên orders_partitioned     → thấy "Seq Scan on orders_part_2024", ít rows hơn
+  Đây là ảnh quan trọng nhất của Bước 5 – cần thấy rõ sự chênh lệch Execution Time
+
+────────────────────────────────────────────────────────────────
+5.3  Kiểm tra phân phối rows từng partition
+────────────────────────────────────────────────────────────────
+Mở Query Tool → chọn PerformanceTest → chạy:
+
+SELECT
+    tableoid::regclass AS partition_name,
+    COUNT(*)           AS row_count
+FROM orders_partitioned
+GROUP BY tableoid
+ORDER BY partition_name;
+[Kết quả dạng text]: 706ms
+"orders_part_2023"	205800
+"orders_part_2024"	300123
+"orders_part_2025"	1077018
+"orders_part_default"	1417059
+
+[EVIDENCE 10c] 1 ảnh – Chụp kết quả bảng SELECT COUNT từng partition:
+               thấy 4 dòng: orders_part_2023 | N, orders_part_2024 | N, orders_part_2025 | N, orders_part_default | N
+
+────────────────────────────────────────────────────────────────
+BẢNG SO SÁNH  (điền kết quả thực tế vào):
+────────────────────────────────────────────────────────────────
+  AGGREGATION GROUP BY status:
+  ┌──────────────────────┬────────────────┬────────────────────────────────┐
+  │ Database             │ Thời gian (ms) │ Ghi chú                        │
+  ├──────────────────────┼────────────────┼────────────────────────────────┤
+  │ NonePerformanceTest  │ 389.605 ms     │ Seq Scan, không có index status │
+  │ PerformanceTest      │ 383.340 ms     │ Có idx_orders_status           │
+  └──────────────────────┴────────────────┴────────────────────────────────┘
+
+  TABLE PARTITIONING (PerformanceTest, filter năm 2024):
+  ┌──────────────────────────────┬────────────────┬────────────────────────────────┐
+  │ Bảng                         │ Thời gian (ms) │ Loại scan                      │
+  ├──────────────────────────────┼────────────────┼────────────────────────────────┤
+  │ orders  (không partition)    │ 886.472 ms     │ Seq Scan – quét toàn bộ 3M rows│
+  │ orders_partitioned           │ 95.126 ms      │ Seq Scan – chỉ đọc 1 partition │
+  │ Cải thiện                    │ ~89.3 %        │ Partition Pruning              │
+  └──────────────────────────────┴────────────────┴────────────────────────────────┘
+
+
+================================================================
+TÓM TẮT EVIDENCE CẦN CHỤP  (tổng ~18 ảnh)
+================================================================
+  SỐ ẢNH  │ EVIDENCE  │ NỘI DUNG
+  ─────────┼───────────┼──────────────────────────────────────────────────
+  1 ảnh    │ 1a        │ pgAdmin – thấy 2 databases trong Object Explorer
+  1–2 ảnh  │ 1b        │ pgAdmin – 4 bảng bên trong mỗi database
+  1 ảnh    │ 2         │ SELECT COUNT(*) UNION ALL – 4 dòng kết quả
+  1 ảnh    │ 3         │ Swagger UI localhost:8081 – thấy 3 API
+  1 ảnh    │ 4         │ /single-insert – Response body JSON (singleInsertMs)
+  1 ảnh    │ 5         │ /batch-insert  – Response body JSON (batchInsertMs)
+  1 ảnh    │ 6a        │ EXPLAIN 3.1a – Seq Scan on products (category)
+  1 ảnh    │ 6b        │ EXPLAIN 3.1b – Seq Scan on orders (user_id+status)
+  1 ảnh    │ 6c        │ EXPLAIN 3.1c – Seq Scan on products (name,price)
+  2–3 ảnh  │ 7         │ pgAdmin Indexes – danh sách index trong products/orders
+  1 ảnh    │ 8a        │ EXPLAIN 3.3a – Bitmap Index Scan (products, B-Tree)
+  1 ảnh    │ 8b        │ EXPLAIN 3.3b – Bitmap Index Scan (orders, Composite)
+  1 ảnh    │ 8c        │ EXPLAIN 3.3c – Index Only Scan (products, Covering)
+  1 ảnh    │ 9a-1      │ EXPLAIN OFFSET 100     – thời gian nhỏ
+  1 ảnh    │ 9a-2      │ EXPLAIN OFFSET 1000000 – thời gian lớn hơn nhiều
+  1 ảnh    │ 9b        │ EXPLAIN Keyset id>1M   – thời gian nhỏ dù vị trí 1M
+  1 ảnh    │ 10a-1     │ EXPLAIN Aggregation – NonePerformanceTest
+  1 ảnh    │ 10a-2     │ EXPLAIN Aggregation – PerformanceTest
+  1 ảnh    │ 10b-1     │ EXPLAIN orders thường (Seq Scan toàn bộ 3M rows)
+  1 ảnh    │ 10b-2     │ EXPLAIN orders_partitioned (chỉ scan 1 partition)
+  1 ảnh    │ 10c       │ COUNT(*) phân phối từng partition (4 dòng)
+  ─────────┴───────────┴──────────────────────────────────────────────────
+  CÁCH CHỤP TRONG pgAdmin:
+  • Bôi đen ĐÚNG 1 câu EXPLAIN ANALYZE (kéo từ EXPLAIN đến dấu ;)
+  • Nhấn F5 → kết quả hiện ở panel bên dưới
+  • Chụp toàn màn hình pgAdmin (thấy cả SQL + kết quả)
+  • Lặp lại cho câu tiếp theo
+================================================================
